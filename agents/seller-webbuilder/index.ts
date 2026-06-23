@@ -5,6 +5,7 @@ import express from "express";
 import Groq from "groq-sdk";
 import { Keypair } from "@stellar/stellar-sdk";
 import { IdentityClient, CommerceClient, TESTNET, type MarcConfig } from "marc-stellar-sdk";
+import { retryWithBackoff } from "../shared.js";
 
 const cfg: MarcConfig = {
   rpcUrl: process.env.STELLAR_RPC_URL ?? TESTNET.rpcUrl,
@@ -31,9 +32,21 @@ async function generate(prompt: string): Promise<string> {
 }
 
 const identity = new IdentityClient(cfg);
-let agentId = await identity.agentOf(seller.publicKey());
+let agentId: bigint | null = null;
+try {
+  await retryWithBackoff(
+    async () => { agentId = await identity.agentOf(seller.publicKey()); },
+    { maxAttempts: 6, baseDelayMs: 2000, label: AGENT_ID },
+  );
+} catch (err) {
+  console.error(`[${AGENT_ID}] Fatal: identity RPC unreachable —`, (err as Error).message);
+  process.exit(1);
+}
 if (!agentId) {
-  agentId = await identity.register(seller, `ipfs://${AGENT_ID}.json`);
+  await retryWithBackoff(
+    async () => { agentId = await identity.register(seller, `ipfs://${AGENT_ID}.json`); },
+    { maxAttempts: 4, baseDelayMs: 2000, label: AGENT_ID },
+  );
   console.log(`[${AGENT_ID}] Registered as agent #${agentId}`);
 } else {
   console.log(`[${AGENT_ID}] Already agent #${agentId}`);
@@ -59,17 +72,11 @@ app.post("/job", async (req, res) => {
     console.log(`[${AGENT_ID}] Website built (${html.length} chars)`);
 
     const commerce = new CommerceClient(cfg);
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      try {
-        await commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`);
-        console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted`);
-        break;
-      } catch (e) {
-        if (attempt === 5) throw e;
-        console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
-        await new Promise((r) => setTimeout(r, 4000));
-      }
-    }
+    await retryWithBackoff(
+      () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
+      { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+    );
+    console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted`);
   } catch (err) {
     console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
   }
