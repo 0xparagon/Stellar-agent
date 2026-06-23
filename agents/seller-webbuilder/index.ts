@@ -17,8 +17,9 @@ const cfg: MarcConfig = {
 
 const seller = Keypair.fromSecret(process.env.SELLER_SECRET!);
 const port = Number(process.env.SELLER_PORT ?? 4501);
+const publicUrl = (process.env.PUBLIC_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
 const AGENT_ID = "seller-webbuilder";
-const OUTPUT_FILE = "output/website.html";
+const OUTPUT_DIR = "output";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
@@ -44,8 +45,14 @@ app.use(express.json());
 
 app.get("/", (_req, res) => res.json(JSON.parse(fs.readFileSync("agent.json", "utf8"))));
 
+app.use(`/${OUTPUT_DIR}`, express.static(OUTPUT_DIR));
+
 app.post("/job", async (req, res) => {
   const { jobId, task } = req.body;
+  if (!jobId || !task) {
+    res.status(400).json({ error: "missing jobId or task" });
+    return;
+  }
   console.log(`[${AGENT_ID}] Job #${jobId}: ${task}`);
   res.json({ status: "accepted", jobId });
 
@@ -54,15 +61,23 @@ app.post("/job", async (req, res) => {
     const html = await generate(
       `You are a professional web developer. Build a complete, self-contained HTML/CSS website for:\n\n${task}\n\nReturn ONLY raw HTML — no markdown, no code fences. Must have inline CSS, ready to open in a browser.`
     );
-    fs.mkdirSync("output", { recursive: true });
-    fs.writeFileSync(OUTPUT_FILE, html);
-    console.log(`[${AGENT_ID}] Website built (${html.length} chars)`);
+
+    const stripped = html.replace(/```html\s*/gi, "").replace(/```/g, "").trim();
+    if (stripped.length < 50 || !/<!DOCTYPE html|<html/i.test(stripped)) {
+      throw new Error(`Generated content is not valid HTML (${stripped.length} chars, no doctype/html tag)`);
+    }
+
+    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    const filename = `job-${jobId}.html`;
+    fs.writeFileSync(path.join(OUTPUT_DIR, filename), stripped);
+    const deliverable = `${publicUrl}/${OUTPUT_DIR}/${filename}`;
+    console.log(`[${AGENT_ID}] Website built (${stripped.length} chars) → ${deliverable}`);
 
     const commerce = new CommerceClient(cfg);
     for (let attempt = 1; attempt <= 5; attempt++) {
       try {
-        await commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`);
-        console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted`);
+        await commerce.submit(seller, BigInt(jobId), deliverable);
+        console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
         break;
       } catch (e) {
         if (attempt === 5) throw e;
