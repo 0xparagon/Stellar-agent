@@ -13,6 +13,20 @@
  */
 import "dotenv/config";
 import { spawn, type ChildProcess } from "node:child_process";
+import * as readline from "node:readline";
+
+const STEP_MODE = process.argv.includes("--step");
+
+function pause(label: string): Promise<void> {
+  if (!STEP_MODE) return Promise.resolve();
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`\n[step] ${label} — press Enter to continue...`, () => {
+      rl.close();
+      resolve();
+    });
+  });
+}
 
 const X402_FAIL_PATTERNS = [
   "Payment verification failed",
@@ -42,6 +56,9 @@ function waitForOutput(proc: ChildProcess, pattern: string, timeoutMs = 90_000):
 }
 
 async function main() {
+  if (STEP_MODE) log("--step mode enabled: will pause between phases");
+
+  await pause("about to start seller-agent");
   log("starting seller-agent...");
   const seller = spawn("npx", ["tsx", "seller-agent.ts"], {
     cwd: import.meta.dirname,
@@ -63,6 +80,7 @@ async function main() {
   // Give server a moment to fully bind.
   await new Promise((r) => setTimeout(r, 2000));
 
+  await pause("seller is ready — about to run buyer-agent");
   log("running buyer-agent...");
   const buyer = spawn("npx", ["tsx", "buyer-agent.ts"], {
     cwd: import.meta.dirname,
@@ -92,6 +110,7 @@ async function main() {
     buyer.on("exit", (code) => resolve(code ?? 1));
   });
 
+  await pause("buyer finished — about to shut down seller");
   log("buyer finished, shutting down seller...");
   seller.kill("SIGTERM");
 

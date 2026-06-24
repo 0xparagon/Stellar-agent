@@ -864,3 +864,46 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
   .contracts-grid { grid-template-columns: 1fr; }
   .footer-inner { flex-direction: column; gap: 20px; text-align: center; }
 }
+
+/* ── Mobile Nav (#82) ── */
+.hamburger {
+  display: none;
+  flex-direction: column;
+  gap: 5px;
+  padding: 4px;
+  cursor: pointer;
+  order: -1;
+  margin-right: 8px;
+}
+.hamburger span {
+  display: block;
+  width: 22px;
+  height: 2px;
+  background: var(--text);
+  border-radius: 2px;
+  transition: transform 0.2s, opacity 0.2s;
+}
+.hamburger[aria-expanded="true"] span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+.hamburger[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+.hamburger[aria-expanded="true"] span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
+
+@media (max-width: 768px) {
+  .hamburger { display: flex; }
+
+  .nav-links {
+    display: none;
+    position: absolute;
+    top: 64px;
+    left: 0; right: 0;
+    background: rgba(10, 10, 10, 0.97);
+    border-bottom: 1px solid var(--border);
+    flex-direction: column;
+    padding: 16px 24px;
+    gap: 4px;
+  }
+  .nav-links.nav-open { display: flex; }
+  .nav-link { padding: 10px 0; font-size: 1rem; }
+
+  .nav-actions .btn { display: none; }
+  .nav-actions .icon-btn { display: none; }
+}
