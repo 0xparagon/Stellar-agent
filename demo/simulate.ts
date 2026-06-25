@@ -12,7 +12,7 @@
  */
 import "dotenv/config";
 import express from "express";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk";
 import {
   IdentityClient,
   CommerceClient,
@@ -35,6 +35,31 @@ const BASE_PORT = 4410;
 const NUM_SELLERS = 4;
 const NUM_BUYERS = 5;
 const BUDGET = BigInt(10_000_000); // 1 USDC
+
+/** Decode a raw ScVal hex/base64 string to a native JS value for readable logging. */
+function decodeScVal(raw: unknown): unknown {
+  if (typeof raw !== "string") return raw;
+  for (const enc of ["hex", "base64"] as const) {
+    try {
+      return scValToNative(xdr.ScVal.fromXDR(raw, enc));
+    } catch { /* try next encoding */ }
+  }
+  return raw;
+}
+
+/** Format an error, decoding any embedded XDR/ScVal hex in the message. */
+function fmtError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  // Replace long hex runs that look like XDR payloads with their decoded form.
+  return err.message.replace(/\b([0-9a-f]{32,})\b/gi, (hex) => {
+    try {
+      const decoded = scValToNative(xdr.ScVal.fromXDR(hex, "hex"));
+      return `[ScVal: ${JSON.stringify(decoded)}]`;
+    } catch {
+      return hex;
+    }
+  });
+}
 
 function tag(role: string, i: number) {
   return `[${role}-${i}]`;
@@ -142,7 +167,7 @@ async function runBuyer(
   // Buyer (evaluator) completes job → 99/1 split
   await commerce.complete(kp, jobId);
   const job = await commerce.getJob(jobId);
-  console.log(`${t} job #${jobId} completed — status: ${job?.status} — 99% to seller, 1% fee`);
+  console.log(`${t} job #${jobId} completed — status: ${job?.status ?? "unknown"} — 99% to seller, 1% fee`);
 }
 
 // --- Main ---
@@ -170,6 +195,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("FATAL:", fmtError(err));
   process.exit(1);
 });
