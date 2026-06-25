@@ -492,7 +492,7 @@ app.get("/app/*", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-const PORT = Number(process.env.DASHBOARD_PORT ?? 3000);
+const PORT = Number(process.env.PORT || process.env.DASHBOARD_PORT || 3000);
 app.listen(PORT, () => {
   console.log(`Bear Dashboard → http://localhost:${PORT}`);
   console.log(`  Buyer:  ${buyerKeypair.publicKey()}`);
