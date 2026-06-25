@@ -2,6 +2,7 @@ import "dotenv/config";
 import blessed from "blessed";
 import { Keypair, Contract, Account, TransactionBuilder, BASE_FEE, Address, scValToNative, rpc } from "@stellar/stellar-sdk";
 import { IdentityClient, CommerceClient, TESTNET, type MarcConfig, type Job } from "marc-stellar-sdk";
+import { retryWithBackoff } from "../shared.js";
 
 const cfg: MarcConfig = {
   rpcUrl: process.env.STELLAR_RPC_URL ?? TESTNET.rpcUrl,
@@ -254,39 +255,19 @@ async function submitTask(task: string) {
     );
     log(`{green-fg}Job #${jobId} created — 1 USDC locked in escrow{/green-fg}`);
 
-    // Notify seller server
+    // Notify seller server with retry on 5xx
     log(`Sending job to ${picked.name} at ${picked.url}...`);
-    const sellerRes = await fetch(`${picked.url}/job`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId: jobId.toString(), task }),
-    });
-
-    if (!sellerRes.ok) {
-      const text = await sellerRes.text();
-      log(`{red-fg}Seller rejected job request: ${sellerRes.status} ${text}{/red-fg}`);
-      log(`{red-fg}Cancelling job #${jobId} — no payment issued{/red-fg}`);
-      await commerce.cancel(buyer, jobId);
-      return;
-    }
-
-    let sellerBody: any;
-    try {
-      sellerBody = await sellerRes.json();
-    } catch {
-      log(`{red-fg}Seller returned invalid JSON for job acceptance{/red-fg}`);
-      log(`{red-fg}Cancelling job #${jobId} — no payment issued{/red-fg}`);
-      await commerce.cancel(buyer, jobId);
-      return;
-    }
-
-    if (sellerBody?.status !== "accepted" || sellerBody?.jobId !== jobId.toString()) {
-      log(`{red-fg}Seller response failed validation: ${JSON.stringify(sellerBody)}{/red-fg}`);
-      log(`{red-fg}Cancelling job #${jobId} — no payment issued{/red-fg}`);
-      await commerce.cancel(buyer, jobId);
-      return;
-    }
-
+    await retryWithBackoff(
+      async () => {
+        const r = await fetch(`${picked.url}/job`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jobId: jobId.toString(), task }),
+        });
+        if (r.status >= 500) throw new Error(`Seller returned ${r.status}`);
+      },
+      { maxAttempts: 3, baseDelayMs: 1000, label: picked.name },
+    );
     log(`{cyan-fg}${picked.name} accepted the job — working...{/cyan-fg}`);
     log(`Waiting for deliverable...`);
 

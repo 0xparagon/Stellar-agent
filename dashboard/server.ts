@@ -1,8 +1,9 @@
-import express from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import path from "path";
 import { fileURLToPath } from "url";
+import { z, ZodError } from "zod";
 import { Keypair, rpc, Account, TransactionBuilder, BASE_FEE, Address, nativeToScVal, Contract, xdr, scValToNative } from "@stellar/stellar-sdk";
-import { cfg, buyerKeypair, sellerKeypair, getKeypair } from "./lib/config.js";
+import { cfg, buyerKeypair, sellerKeypair, getKeypair, DEMO_MODE } from "./lib/config.js";
 import {
   getAllAgents,
   getAllJobs,
@@ -10,6 +11,8 @@ import {
   invalidateJobs,
   identity,
   commerce,
+  events,
+  getFeeBps,
 } from "./lib/discovery.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -26,6 +29,111 @@ app.use("/app", express.static(path.join(__dirname, "public")));
 const server = new rpc.Server(cfg.rpcUrl, {
   allowHttp: cfg.rpcUrl.startsWith("http://"),
 });
+
+const allowedOrigins = new Set(
+  (process.env.DASHBOARD_ORIGINS ?? "http://localhost:3000,http://127.0.0.1:3000")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+);
+
+function isStellarAddress(value: string): boolean {
+  try {
+    new Address(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const stellarAddressSchema = z
+  .string()
+  .min(1)
+  .refine(isStellarAddress, { message: "Invalid Stellar public key" });
+
+const numericIdParamSchema = z.object({
+  id: z.string().regex(/^[0-9]+$/, "Job ID must be a positive integer").transform(BigInt),
+});
+
+const registerAgentSchema = z.object({
+  wallet: stellarAddressSchema,
+  uri: z.string().min(1).optional(),
+});
+
+const createJobSchema = z.object({
+  wallet: stellarAddressSchema,
+  provider: stellarAddressSchema.optional(),
+  evaluator: stellarAddressSchema.optional(),
+  budget: z.union([z.string().regex(/^[0-9]+$/), z.number().int().nonnegative()]).optional(),
+  description: z.string().min(1).optional(),
+});
+
+const submitJobSchema = z.object({
+  wallet: stellarAddressSchema,
+  deliverable: z.string().min(1).optional(),
+});
+
+const walletOnlySchema = z.object({
+  wallet: stellarAddressSchema,
+});
+
+const buildRegisterSchema = z.object({
+  publicKey: stellarAddressSchema,
+  uri: z.string().min(1).optional(),
+});
+
+const buildCreateJobSchema = z.object({
+  publicKey: stellarAddressSchema,
+  provider: stellarAddressSchema.optional(),
+  evaluator: stellarAddressSchema.optional(),
+  budget: z.union([z.string().regex(/^[0-9]+$/), z.number().int().nonnegative()]).optional(),
+  description: z.string().min(1).optional(),
+});
+
+const buildUnsignedActionSchema = z.object({
+  publicKey: stellarAddressSchema,
+  jobId: z.string().regex(/^[0-9]+$/, "Job ID must be a positive integer"),
+});
+
+const submitXdrSchema = z.object({
+  signedXdr: z.string().min(1),
+});
+
+const jobsQuerySchema = z.object({
+  status: z.string().min(1).optional(),
+});
+
+function parseBudget(value: string | number | undefined, defaultValue = 10_000_000n): bigint {
+  if (value === undefined || value === null) return defaultValue;
+  return typeof value === "number" ? BigInt(value) : BigInt(value);
+}
+
+function respondWithValidationError(err: unknown, res: Response): boolean {
+  if (err instanceof ZodError) {
+    res.status(400).json({ error: "Invalid request payload", details: err.errors });
+    return true;
+  }
+  return false;
+}
+
+function corsOriginHandler(req: Request, res: Response, next: NextFunction) {
+  const origin = req.headers.origin;
+  if (!origin) return next();
+  if (!allowedOrigins.has(origin)) {
+    return res.status(403).json({ error: "Origin not allowed" });
+  }
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  return next();
+}
+
+app.use(corsOriginHandler);
+app.options("*", (_req, res) => res.sendStatus(204));
+
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/healthz", (_req, res) => res.send("ok"));
 
 // --- Helpers ---
 
@@ -94,13 +202,24 @@ async function getTokenBalance(pubkey: string): Promise<string> {
 
 // --- API Routes ---
 
+// GET /api/demo-mode — lets the frontend know whether to skip Freighter auth
+app.get("/api/demo-mode", (_req, res) => {
+  res.json({
+    enabled: DEMO_MODE,
+    ...(DEMO_MODE && {
+      buyer: buyerKeypair.publicKey(),
+      seller: sellerKeypair.publicKey(),
+    }),
+  });
+});
+
 // GET /api/stats
 app.get("/api/stats", async (_req, res) => {
   try {
     const [agents, jobs, feeBps] = await Promise.all([
       getAllAgents(),
       getAllJobs(),
-      commerce.feeBps(),
+      getFeeBps(),
     ]);
     const activeJobs = jobs.filter(
       (j) => j.status === "Funded" || j.status === "Submitted",
@@ -114,6 +233,41 @@ app.get("/api/stats", async (_req, res) => {
   } catch (err: unknown) {
     res.status(500).json({ error: (err as Error).message });
   }
+});
+
+// Server-Sent Events: simple real-time stream for dashboard clients
+app.get("/api/stream", (req, res) => {
+  // Headers for SSE
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const send = (event: string, data: unknown) => {
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  // Emit a welcome ping
+  send("hello", { message: "connected" });
+
+  const onInvalidate = (payload: unknown) => {
+    send("invalidate", payload);
+  };
+
+  events.on("invalidate", onInvalidate);
+
+  // heartbeat
+  const hb = setInterval(() => send("ping", { t: Date.now() }), 25000);
+
+  req.on("close", () => {
+    clearInterval(hb);
+    events.off("invalidate", onInvalidate);
+  });
 });
 
 // GET /api/wallets
@@ -149,12 +303,13 @@ app.get("/api/agents", async (_req, res) => {
 // POST /api/agents/register
 app.post("/api/agents/register", async (req, res) => {
   try {
-    const { wallet, uri } = req.body;
-    const kp = getKeypair(wallet);
-    const agentId = await identity.register(kp, uri || "ipfs://dashboard-agent");
+    const parsed = registerAgentSchema.parse(req.body);
+    const kp = getKeypair(parsed.wallet);
+    const agentId = await identity.register(kp, parsed.uri || "ipfs://dashboard-agent");
     invalidateAgents();
     res.json({ agentId: agentId.toString() });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -162,13 +317,14 @@ app.post("/api/agents/register", async (req, res) => {
 // GET /api/jobs
 app.get("/api/jobs", async (req, res) => {
   try {
+    const parsed = jobsQuerySchema.parse(req.query);
     let jobs = await getAllJobs();
-    const status = req.query.status as string | undefined;
-    if (status) {
-      jobs = jobs.filter((j) => j.status === status);
+    if (parsed.status) {
+      jobs = jobs.filter((j) => j.status === parsed.status);
     }
     res.json(serialize(jobs));
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -181,17 +337,25 @@ app.post("/api/jobs/create", async (req, res) => {
     const providerAddr = provider || sellerKeypair.publicKey();
     const evaluatorAddr = evaluator || kp.publicKey();
     const budgetBn = BigInt(budget || 10_000_000); // default 1 MUSD
+
+    const agentId = await identity.agentOf(providerAddr);
+    if (agentId === null) {
+      res.status(400).json({ error: `Provider ${providerAddr} is not a registered agent` });
+      return;
+    }
+
     const jobId = await commerce.createJob(
       kp,
       providerAddr,
       evaluatorAddr,
       cfg.usdcToken,
       budgetBn,
-      description || "Dashboard test job",
+      parsed.description || "Dashboard test job",
     );
     invalidateJobs();
     res.json({ jobId: jobId.toString() });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -199,13 +363,14 @@ app.post("/api/jobs/create", async (req, res) => {
 // POST /api/jobs/:id/submit
 app.post("/api/jobs/:id/submit", async (req, res) => {
   try {
-    const { wallet, deliverable } = req.body;
-    const kp = getKeypair(wallet);
-    const jobId = BigInt(req.params.id);
-    await commerce.submit(kp, jobId, deliverable || "ipfs://dashboard-delivery");
+    const params = numericIdParamSchema.parse(req.params);
+    const parsed = submitJobSchema.parse(req.body);
+    const kp = getKeypair(parsed.wallet);
+    await commerce.submit(kp, params.id, parsed.deliverable || "ipfs://dashboard-delivery");
     invalidateJobs();
     res.json({ success: true });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -213,13 +378,14 @@ app.post("/api/jobs/:id/submit", async (req, res) => {
 // POST /api/jobs/:id/complete
 app.post("/api/jobs/:id/complete", async (req, res) => {
   try {
-    const { wallet } = req.body;
-    const kp = getKeypair(wallet);
-    const jobId = BigInt(req.params.id);
-    await commerce.complete(kp, jobId);
+    const params = numericIdParamSchema.parse(req.params);
+    const parsed = walletOnlySchema.parse(req.body);
+    const kp = getKeypair(parsed.wallet);
+    await commerce.complete(kp, params.id);
     invalidateJobs();
     res.json({ success: true });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -227,12 +393,45 @@ app.post("/api/jobs/:id/complete", async (req, res) => {
 // POST /api/jobs/:id/cancel
 app.post("/api/jobs/:id/cancel", async (req, res) => {
   try {
-    const { wallet } = req.body;
-    const kp = getKeypair(wallet);
-    const jobId = BigInt(req.params.id);
-    await commerce.cancel(kp, jobId);
+    const params = numericIdParamSchema.parse(req.params);
+    const parsed = walletOnlySchema.parse(req.body);
+    const kp = getKeypair(parsed.wallet);
+    await commerce.cancel(kp, params.id);
     invalidateJobs();
     res.json({ success: true });
+  } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// PUT /api/jobs/:id — cancel a job; builds unsigned XDR when publicKey provided,
+// or invokes directly when wallet (server keypair) is provided.
+app.put("/api/jobs/:id", async (req, res) => {
+  try {
+    const { action, publicKey, wallet } = req.body;
+    if (action !== "cancel") {
+      res.status(400).json({ error: "unsupported action; use action: 'cancel'" });
+      return;
+    }
+    const jobId = BigInt(req.params.id);
+
+    if (publicKey) {
+      // Freighter path: return unsigned XDR for client-side signing
+      const op = commerceContract.call(
+        "cancel",
+        new Address(publicKey).toScVal(),
+        nativeToScVal(jobId, { type: "u64" }),
+      );
+      const txXdr = await buildTxXdr(publicKey, op);
+      res.json({ xdr: txXdr });
+    } else {
+      // Server-keypair path: sign and submit directly
+      const kp = getKeypair(wallet);
+      await commerce.cancel(kp, jobId);
+      invalidateJobs();
+      res.json({ success: true });
+    }
   } catch (err: unknown) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -260,15 +459,16 @@ async function buildTxXdr(publicKey: string, op: xdr.Operation): Promise<string>
 // POST /api/build/register — build unsigned register agent tx
 app.post("/api/build/register", async (req, res) => {
   try {
-    const { publicKey, uri } = req.body;
+    const parsed = buildRegisterSchema.parse(req.body);
     const op = identityContract.call(
       "register",
-      new Address(publicKey).toScVal(),
-      nativeToScVal(uri || "ipfs://dashboard-agent", { type: "string" }),
+      new Address(parsed.publicKey).toScVal(),
+      nativeToScVal(parsed.uri || "ipfs://dashboard-agent", { type: "string" }),
     );
-    const txXdr = await buildTxXdr(publicKey, op);
+    const txXdr = await buildTxXdr(parsed.publicKey, op);
     res.json({ xdr: txXdr });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -280,18 +480,26 @@ app.post("/api/build/createJob", async (req, res) => {
     const providerAddr = provider || sellerKeypair.publicKey();
     const evaluatorAddr = evaluator || publicKey;
     const budgetBn = BigInt(budget || 10_000_000);
+
+    const agentId = await identity.agentOf(providerAddr);
+    if (agentId === null) {
+      res.status(400).json({ error: `Provider ${providerAddr} is not a registered agent` });
+      return;
+    }
+
     const op = commerceContract.call(
       "create_job",
-      new Address(publicKey).toScVal(),
+      new Address(parsed.publicKey).toScVal(),
       new Address(providerAddr).toScVal(),
       new Address(evaluatorAddr).toScVal(),
       new Address(cfg.usdcToken).toScVal(),
       nativeToScVal(budgetBn, { type: "i128" }),
-      nativeToScVal(description || "Dashboard test job", { type: "string" }),
+      nativeToScVal(parsed.description || "Dashboard test job", { type: "string" }),
     );
-    const txXdr = await buildTxXdr(publicKey, op);
+    const txXdr = await buildTxXdr(parsed.publicKey, op);
     res.json({ xdr: txXdr });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -299,16 +507,17 @@ app.post("/api/build/createJob", async (req, res) => {
 // POST /api/build/submit — build unsigned submit tx
 app.post("/api/build/submit", async (req, res) => {
   try {
-    const { publicKey, jobId, deliverable } = req.body;
+    const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
       "submit",
-      new Address(publicKey).toScVal(),
-      nativeToScVal(BigInt(jobId), { type: "u64" }),
-      nativeToScVal(deliverable || "ipfs://dashboard-delivery", { type: "string" }),
+      new Address(parsed.publicKey).toScVal(),
+      nativeToScVal(BigInt(parsed.jobId), { type: "u64" }),
+      nativeToScVal(req.body.deliverable || "ipfs://dashboard-delivery", { type: "string" }),
     );
-    const txXdr = await buildTxXdr(publicKey, op);
+    const txXdr = await buildTxXdr(parsed.publicKey, op);
     res.json({ xdr: txXdr });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -316,15 +525,16 @@ app.post("/api/build/submit", async (req, res) => {
 // POST /api/build/complete — build unsigned complete tx
 app.post("/api/build/complete", async (req, res) => {
   try {
-    const { publicKey, jobId } = req.body;
+    const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
       "complete",
-      new Address(publicKey).toScVal(),
-      nativeToScVal(BigInt(jobId), { type: "u64" }),
+      new Address(parsed.publicKey).toScVal(),
+      nativeToScVal(BigInt(parsed.jobId), { type: "u64" }),
     );
-    const txXdr = await buildTxXdr(publicKey, op);
+    const txXdr = await buildTxXdr(parsed.publicKey, op);
     res.json({ xdr: txXdr });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -332,15 +542,16 @@ app.post("/api/build/complete", async (req, res) => {
 // POST /api/build/cancel — build unsigned cancel tx
 app.post("/api/build/cancel", async (req, res) => {
   try {
-    const { publicKey, jobId } = req.body;
+    const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
       "cancel",
-      new Address(publicKey).toScVal(),
-      nativeToScVal(BigInt(jobId), { type: "u64" }),
+      new Address(parsed.publicKey).toScVal(),
+      nativeToScVal(BigInt(parsed.jobId), { type: "u64" }),
     );
-    const txXdr = await buildTxXdr(publicKey, op);
+    const txXdr = await buildTxXdr(parsed.publicKey, op);
     res.json({ xdr: txXdr });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -348,8 +559,8 @@ app.post("/api/build/cancel", async (req, res) => {
 // POST /api/submit — submit a Freighter-signed transaction
 app.post("/api/submit", async (req, res) => {
   try {
-    const { signedXdr } = req.body;
-    const tx = TransactionBuilder.fromXDR(signedXdr, cfg.networkPassphrase);
+    const parsed = submitXdrSchema.parse(req.body);
+    const tx = TransactionBuilder.fromXDR(parsed.signedXdr, cfg.networkPassphrase);
     const sent = await server.sendTransaction(tx);
     if (sent.status === "ERROR") {
       throw new Error(`submit failed: ${sent.errorResult}`);
@@ -375,6 +586,7 @@ app.post("/api/submit", async (req, res) => {
     invalidateJobs();
     res.json({ hash: sent.hash, returnValue: String(returnValue ?? "") });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -382,13 +594,14 @@ app.post("/api/submit", async (req, res) => {
 // GET /api/balance/:pubkey — get XLM + MUSD balance for any public key
 app.get("/api/balance/:pubkey", async (req, res) => {
   try {
-    const pubkey = req.params.pubkey;
+    const params = z.object({ pubkey: stellarAddressSchema }).parse(req.params);
     const [xlm, musd] = await Promise.all([
-      getXlmBalance(pubkey),
-      getTokenBalance(pubkey),
+      getXlmBalance(params.pubkey),
+      getTokenBalance(params.pubkey),
     ]);
-    res.json({ address: pubkey, xlm, musd });
+    res.json({ address: params.pubkey, xlm, musd });
   } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -397,6 +610,19 @@ app.get("/api/balance/:pubkey", async (req, res) => {
 app.get("/app/*", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
+
+function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({ error: "Malformed JSON payload" });
+  }
+  if (err instanceof ZodError) {
+    return res.status(400).json({ error: "Invalid request payload", details: err.errors });
+  }
+  console.error("Unhandled server error:", err);
+  res.status(500).json({ error: "Internal server error" });
+}
+
+app.use(errorHandler);
 
 const PORT = Number(process.env.DASHBOARD_PORT ?? 3000);
 app.listen(PORT, () => {

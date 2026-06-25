@@ -10,6 +10,7 @@
     wallets: null,
     agents: null,
     jobs: null,
+    history: null,
     loading: { stats: false, wallets: false, agents: false, jobs: false },
     jobFilter: "All",
   };
@@ -18,6 +19,7 @@
   const wallet = {
     connected: false,
     publicKey: null,
+    network: null, // 'testnet' | 'mainnet' | null
   };
   window.__walletState = wallet;
 
@@ -48,14 +50,53 @@
     swkReady = true;
   }
 
+  // Freighter detection: prefer Freighter if present
+  async function detectFreighter() {
+    try {
+      const api = window.freighterApi || window.freighter;
+      if (api && typeof api.getPublicKey === "function") {
+        const pk = await api.getPublicKey();
+        let net = null;
+        if (typeof api.getNetwork === "function") {
+          try {
+            const n = await api.getNetwork();
+            // freighter may return 'TESTNET'|'PUBLIC' or a passphrase string
+            if (String(n).toLowerCase().includes("test")) net = "testnet";
+            else if (String(n).toLowerCase().includes("pub") || String(n).toLowerCase().includes("main")) net = "mainnet";
+          } catch (e) {}
+        }
+        wallet.connected = true;
+        wallet.publicKey = pk;
+        wallet.network = net || null;
+        updateWalletUI();
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Try detect Freighter immediately
+  detectFreighter();
+
   function disconnectWallet() {
     wallet.connected = false;
     wallet.publicKey = null;
+    // Clear cached state so the next session starts fresh
+    state.stats = null;
+    state.wallets = null;
+    state.agents = null;
+    state.jobs = null;
+    state.history = null;
+    // Tell SWK to disconnect if the API supports it
+    if (swkReady && StellarWalletsKit && typeof StellarWalletsKit.disconnect === "function") {
+      try { StellarWalletsKit.disconnect(); } catch (e) {}
+    }
     updateWalletUI();
     // Re-show the SWK button
     var btnWrapper = document.getElementById("swk-button-wrapper");
     if (btnWrapper) btnWrapper.style.display = "";
     toast("Wallet disconnected");
+    navigate();
   }
 
   function updateWalletUI() {
@@ -71,7 +112,15 @@
         var addrDisplay = document.getElementById("wallet-addr-display");
         if (addrDisplay) addrDisplay.onclick = function() { copyToClipboard(wallet.publicKey); };
       }
-      if (modeLabel) modeLabel.textContent = "Connected";
+      if (modeLabel) {
+        const netLabel = wallet.network === "mainnet" ? "Mainnet" : wallet.network === "testnet" ? "Testnet" : "Connected";
+        modeLabel.textContent = "Connected — " + netLabel;
+      }
+      // Update sidebar network badge
+      try {
+        var nb = document.getElementById("network-badge");
+        if (nb) nb.innerHTML = '<span class="badge-dot"></span>' + (wallet.network === "mainnet" ? "Stellar Mainnet" : wallet.network === "testnet" ? "Stellar Testnet" : "Unknown Network");
+      } catch (e) {}
       // Hide the SWK connect button once connected
       if (btnWrapper) btnWrapper.style.display = "none";
     } else {
@@ -89,16 +138,34 @@
       body: { publicKey: wallet.publicKey, ...params },
     });
     // 2. Sign with Stellar Wallets Kit
+    // Prefer Freighter if available
+    try {
+      const api = window.freighterApi || window.freighter;
+      if (api && typeof api.signTransaction === "function") {
+        if (wallet.network === "mainnet") throw new Error("Freighter is on Mainnet — dashboard blocks mainnet signing to avoid real transactions");
+        const sigRes = await api.signTransaction(buildRes.xdr);
+        // Accept multiple possible response shapes
+        const signedXdr = sigRes.signedTransaction || sigRes.signedTx || sigRes.signedTxXdr || sigRes.signedXdr || sigRes;
+        return await apiClientSubmit(signedXdr);
+      }
+    } catch (e) {
+      // Fall through to SWK path if Freighter signing fails
+      console.warn("Freighter signing failed, falling back to SWK:", e);
+    }
+
     if (!swkReady) throw new Error("Stellar Wallets Kit not loaded");
     var { address } = await StellarWalletsKit.getAddress();
     var { signedTxXdr } = await StellarWalletsKit.signTransaction(buildRes.xdr, {
       networkPassphrase: "Test SDF Network ; September 2015",
       address: address,
     });
-    // 3. Submit signed tx via server
+    return await apiClientSubmit(signedTxXdr);
+  }
+
+  async function apiClientSubmit(signedXdr) {
     return await api("/submit", {
       method: "POST",
-      body: { signedXdr: signedTxXdr },
+      body: { signedXdr: signedXdr },
     });
   }
 
@@ -529,6 +596,86 @@
     );
   }
 
+  // 5. Transaction History
+  async function renderHistory() {
+    setPage(
+      '<div class="page-header"><div class="page-title">Transaction History</div><div class="page-subtitle">All past activity on the Bear Protocol contracts</div></div>'
+      + skeletonList(6)
+    );
+
+    await Promise.all([loadJobs(), loadAgents()]);
+
+    var jobs = state.jobs || [];
+    var agents = state.agents || [];
+
+    // Build a unified event list: jobs (all statuses) + agent registrations
+    var events = [];
+    for (var j of jobs) {
+      events.push({ kind: "job", id: j.id, status: j.status, desc: j.description || "—", budget: j.budget, actor: j.client });
+    }
+    for (var a of agents) {
+      events.push({ kind: "agent", id: a.id, uri: a.uri, actor: a.owner });
+    }
+    // Sort by numeric id descending (latest first)
+    events.sort(function(a, b) { return Number(b.id) - Number(a.id); });
+
+    if (events.length === 0) {
+      setPage(
+        '<div class="page-header"><div class="page-title">Transaction History</div><div class="page-subtitle">All past activity on the Bear Protocol contracts</div></div>'
+        + '<div class="empty-state">'
+        + '<div class="empty-icon"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></div>'
+        + '<div class="empty-title">No history yet</div>'
+        + '<div class="empty-desc">Jobs and agent registrations will appear here.</div></div>'
+      );
+      return;
+    }
+
+    var rows = '<div class="history-list">';
+    for (var ev of events) {
+      var icon, label, meta, badge;
+      if (ev.kind === "job") {
+        icon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>';
+        label = escapeHtml(ev.desc);
+        meta = 'Client: ' + truncAddr(ev.actor) + ' &nbsp;·&nbsp; ' + formatMusd(ev.budget) + ' MUSD';
+        badge = statusBadge(ev.status);
+      } else {
+        icon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>';
+        label = 'Agent registered';
+        meta = 'Owner: ' + truncAddr(ev.actor) + ' &nbsp;·&nbsp; ' + escapeHtml(ev.uri || '');
+        badge = '<span class="status-badge status-Completed"><span class="dot"></span>Registered</span>';
+      }
+      rows += '<div class="history-row">'
+        + '<div class="history-icon ' + (ev.kind === 'job' ? 'hist-job' : 'hist-agent') + '">' + icon + '</div>'
+        + '<div class="history-body">'
+        + '<div class="history-label">' + label + '</div>'
+        + '<div class="history-meta">' + meta + '</div>'
+        + '</div>'
+        + '<div class="history-right">'
+        + '<div class="history-id">#' + escapeHtml(String(ev.id)) + '</div>'
+        + badge
+        + '</div>'
+        + '</div>';
+    }
+    rows += '</div>';
+
+    var summary = '<div class="stat-grid" style="margin-bottom:24px;grid-template-columns:repeat(3,1fr)">'
+      + '<div class="stat-card"><div class="stat-card-top"><div class="stat-label">Total Jobs</div>'
+      + '<div class="stat-icon blue"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></div>'
+      + '</div><div class="stat-value">' + jobs.length + '</div></div>'
+      + '<div class="stat-card"><div class="stat-card-top"><div class="stat-label">Completed</div>'
+      + '<div class="stat-icon green"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg></div>'
+      + '</div><div class="stat-value">' + jobs.filter(function(j) { return j.status === "Completed"; }).length + '</div></div>'
+      + '<div class="stat-card"><div class="stat-card-top"><div class="stat-label">Agents Registered</div>'
+      + '<div class="stat-icon orange"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div>'
+      + '</div><div class="stat-value">' + agents.length + '</div></div>'
+      + '</div>';
+
+    setPage(
+      '<div class="page-header"><div class="page-title">Transaction History</div><div class="page-subtitle">All past activity on the Bear Protocol contracts</div></div>'
+      + summary + rows
+    );
+  }
+
   // ── Global Actions ──
 
   window.__copy = copyToClipboard;
@@ -689,6 +836,7 @@
     "/wallet": renderWallets,
     "/jobs": renderJobs,
     "/agents": renderAgents,
+    "/history": renderHistory,
   };
 
   function getRoute() {
@@ -761,6 +909,13 @@
         if (JSON.stringify(state.wallets) !== oldWallets) {
           renderWallets();
         }
+      } else if (route === "/history") {
+        var oldJobs3 = JSON.stringify(state.jobs);
+        var oldAgents3 = JSON.stringify(state.agents);
+        await Promise.all([loadJobs(), loadAgents()]);
+        if (JSON.stringify(state.jobs) !== oldJobs3 || JSON.stringify(state.agents) !== oldAgents3) {
+          renderHistory();
+        }
       }
     } catch (e) {
       // silent — don't break polling on transient errors
@@ -781,6 +936,27 @@
   document.addEventListener("visibilitychange", function() {
     if (document.hidden) { stopPolling(); } else { startPolling(); poll(); }
   });
+
+  // Server-Sent Events: listen for invalidation events to refresh quickly
+  if (typeof EventSource !== "undefined") {
+    try {
+      const es = new EventSource("/api/stream");
+      es.addEventListener("invalidate", function(e) {
+        try {
+          const payload = JSON.parse(e.data);
+          // On any invalidation, run a quick poll to refresh current view
+          poll();
+        } catch (err) { poll(); }
+      });
+      es.addEventListener("ping", function() {});
+      es.onerror = function() {
+        // Close noisy stream errors; polling remains as a fallback
+        try { es.close(); } catch (e) {}
+      };
+    } catch (e) {
+      // ignore SSE setup failures — polling is the primary mechanism
+    }
+  }
 
   // Initial render
   navigate();
