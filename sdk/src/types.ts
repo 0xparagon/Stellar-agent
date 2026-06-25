@@ -102,7 +102,9 @@ export interface MarcConfig {
 export const TESTNET = {
   network: "stellar-testnet" as const,
   networkPassphrase: "Test SDF Network ; September 2015",
-  rpcUrl: "https://soroban-testnet.stellar.org",
+  rpcUrl: (typeof process !== "undefined" && process.env["STELLAR_RPC_URL"])
+    ? process.env["STELLAR_RPC_URL"]
+    : "https://soroban-testnet.stellar.org",
   identityContract:
     "CAMPXYFZJTIPEVOPOAZPRG5OHXKNBDPGTPRCOIO4LVPGEM4TONPY65A5" as Address,
   commerceContract:
