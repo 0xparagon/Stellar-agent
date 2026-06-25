@@ -138,6 +138,22 @@ export class CommerceClient {
     await this.invoke(admin, op, () => undefined);
   }
 
+  /**
+   * Get the balance of `address` for a given token.
+   * Pass `"native"` for XLM (returns stroops as bigint),
+   * or a Soroban token contract address for SAC/custom tokens.
+   */
+  async getBalance(address: string, token: string): Promise<bigint> {
+    if (token === "native") {
+      const account = await this.server.getAccount(address);
+      const xlmBalance = account.balances.find((b) => b.asset_type === "native");
+      return BigInt(Math.round(Number(xlmBalance?.balance ?? "0") * 1e7));
+    }
+    const tokenContract = new Contract(token);
+    const op = tokenContract.call("balance", new Address(address).toScVal());
+    return await this.simulate(op, (v) => BigInt(scValToNative(v) as string));
+  }
+
   // --- internals (same pattern as IdentityClient) ---
 
   private async invoke<T>(
